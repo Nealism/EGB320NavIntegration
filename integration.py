@@ -98,33 +98,61 @@ def calibrate_forward_orientations(test_duty=40, sample_s=0.25):
     sleep(0.2)
 
 def turnAngle(angle_deg,
-              max_duty=55, min_duty=25,
-              kp=120.0,
+              max_duty=65, min_duty=35,
+              kp=110.0,
               timeout_s=6.0,
               eps_deg=2.0,
-              rpm_alpha=0.3):   # 0..1 (higher = less smoothing)
+              rpm_alpha=0.4,
+              do_probe=True,          # <— key: normalise encoder delta sign
+              debug=False):
 
     # --- geometry ---
     Rw_mm = WHEEL_DIAMETER_MM / 2.0
     L_mm  = TRACK_WIDTH_MM
     theta_rad = math.radians(angle_deg)
-
-    # target "revs difference" = (rev_R - rev_L) needed for the yaw
     target_revs_diff = (theta_rad * L_mm) / (2.0 * math.pi * Rw_mm)
     eps_revs_diff    = (math.radians(eps_deg) * L_mm) / (2.0 * math.pi * Rw_mm)
 
+    # Nominal spin directions (keep "one fwd / one back" ALL the time)
+    # +angle (left/CCW): RIGHT forward, LEFT backward
+    # -angle (right/CW): LEFT forward, RIGHT backward
+    left_nominal_sign, right_nominal_sign = ( -1, +1 ) if angle_deg >= 0 else ( +1, -1 )
+
+    # Always start from rest
+    board.motor_stop(board.ALL)
+    sleep(0.05)
+
+    # ---- PROBE: figure out the sign of (rpmR - rpmL) for THIS pattern ----
+    # dir_gain makes "progress" positive when turning the requested way
+    dir_gain = 1.0
+    if do_probe:
+        probe_duty = max(min_duty + 5, 30)
+        set_wheel(LEFT_MOTOR_ID,  left_nominal_sign  * probe_duty, LEFT_FORWARD_ORIENT)
+        set_wheel(RIGHT_MOTOR_ID, right_nominal_sign * probe_duty, RIGHT_FORWARD_ORIENT)
+        sleep(0.20)
+        rpm_L0, rpm_R0 = read_rpm()
+        board.motor_stop(board.ALL)
+        sleep(0.05)
+        delta0 = (rpm_R0 - rpm_L0)
+        # If delta is <= 0, measured progress has opposite sign; flip the measurement sign
+        dir_gain = 1.0 if delta0 > 0 else -1.0
+        if debug:
+            print(f"[probe] rpm_L={rpm_L0:.1f}, rpm_R={rpm_R0:.1f}, delta={delta0:.1f}, dir_gain={dir_gain}")
+
+    # Optional "kick" to unstick
+    kick_duty = max(min_duty, int(0.6 * max_duty))
+    set_wheel(LEFT_MOTOR_ID,  left_nominal_sign  * kick_duty, LEFT_FORWARD_ORIENT)
+    set_wheel(RIGHT_MOTOR_ID, right_nominal_sign * kick_duty, RIGHT_FORWARD_ORIENT)
+    sleep(0.15)
+
     # --- integrators / filters ---
-    revs_diff = 0.0
+    revs_diff_norm = 0.0   # normalised "progress" (always increases for requested direction)
     t_prev = monotonic()
     t_start = t_prev
     rpmL_f = None
     rpmR_f = None
 
-    # choose nominal spin pattern from requested direction
-    # +angle (CCW/left): RIGHT forward, LEFT backward
-    # -angle (CW/right): LEFT forward, RIGHT backward
-    left_nominal_sign, right_nominal_sign = ( -1, +1 ) if angle_deg >= 0 else ( +1, -1 )
-
+    # Control loop
     while True:
         t_now = monotonic()
         dt = t_now - t_prev
@@ -132,7 +160,6 @@ def turnAngle(angle_deg,
         if dt <= 0:
             dt = 1e-3
 
-        # read and smooth rpm
         rpm_L, rpm_R = read_rpm()
         if rpmL_f is None:
             rpmL_f, rpmR_f = rpm_L, rpm_R
@@ -140,41 +167,50 @@ def turnAngle(angle_deg,
             rpmL_f = (1 - rpm_alpha) * rpmL_f + rpm_alpha * rpm_L
             rpmR_f = (1 - rpm_alpha) * rpmR_f + rpm_alpha * rpm_R
 
-        # integrate (rev_R - rev_L)
-        revs_diff += ((rpmR_f - rpmL_f) / 60.0) * dt
+        # Normalised progress (flip sign if probe said it's inverted)
+        revs_diff_norm += (dir_gain * (rpmR_f - rpmL_f) / 60.0) * dt
 
-        # remaining error in revs_diff
-        err = target_revs_diff - revs_diff
+        err = target_revs_diff - revs_diff_norm
 
         # stop conditions
         if abs(err) <= max(eps_revs_diff, 1e-4):
             break
         if (t_now - t_start) > timeout_s:
+            if debug:
+                print("[turnAngle] timeout")
             break
 
-        # simple P control -> duty magnitude
-        raw  = kp * err
-        mag  = max(min(abs(raw), max_duty), min_duty)
+        # P-control for duty magnitude
+        raw = kp * err
+        mag = max(min(abs(raw), max_duty), min_duty)
 
-        # if we overshoot (err changes sign) reverse both wheels to pull back
-        # this preserves "one forward, one backward" at all times
-        correction_sign = 1.0 if raw >= 0 else -1.0
+        # Preserve in-place pattern at all times.
+        # If we overshoot (err < 0), both commands flip sign together,
+        # still keeping one fwd, one back.
+        s = 1.0 if raw >= 0 else -1.0
+        left_cmd  = left_nominal_sign  * s * mag
+        right_cmd = right_nominal_sign * s * mag
 
-        left_cmd  = left_nominal_sign  * correction_sign * mag
-        right_cmd = right_nominal_sign * correction_sign * mag
-
-        # IMPORTANT: always pass the wheel's *forward* orientation;
-        # negative duty makes it spin backward.
         set_wheel(LEFT_MOTOR_ID,  left_cmd,  LEFT_FORWARD_ORIENT)
         set_wheel(RIGHT_MOTOR_ID, right_cmd, RIGHT_FORWARD_ORIENT)
 
         sleep(0.05)
 
-    # stop + report angle estimate
+    # Stop + short brake to kill inertia
     board.motor_stop(board.ALL)
-    sleep(0.05)
-    achieved_theta_rad = (revs_diff * (2.0 * math.pi * Rw_mm)) / L_mm
+    sleep(0.03)
+    # Small opposite pulse (brake)
+    brake = max(0, min(min_duty, 30))
+    if brake > 0:
+        set_wheel(LEFT_MOTOR_ID,  -left_nominal_sign  * brake, LEFT_FORWARD_ORIENT)
+        set_wheel(RIGHT_MOTOR_ID, -right_nominal_sign * brake, RIGHT_FORWARD_ORIENT)
+        sleep(0.05)
+        board.motor_stop(board.ALL)
+
+    # Report achieved angle using the normalised progress
+    achieved_theta_rad = (revs_diff_norm * (2.0 * math.pi * Rw_mm)) / L_mm
     return math.degrees(achieved_theta_rad)
+
 
 
 
@@ -235,6 +271,7 @@ if __name__ == "__main__":
     finally:
         camera.close()
         cv2.destroyAllWindows()
+
 
 
 
