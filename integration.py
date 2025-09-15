@@ -350,6 +350,19 @@ if __name__ == "__main__":
                   else:
                      board.motor_stop(board.ALL)
                      robotMode = RobotMode.DEBUG_STOP
+
+            if robotMode == RobotMode.ARRIVE_BAY:
+               directionM = TARGET_BAY % 2
+               if directionM == 0:
+                  direction = 'left'
+               elif directionM == 1:
+                  direction = 'right'
+               if direction == 'left':
+                  turnAngle_seconds(-90)
+                  robotMode = RobotMode.DEBUG_STOP
+               elif direction == 'right':
+                  turnAngle_seconds(90)
+                  robotMode = RobotMode.DEBUG_STOP
                   
 
     except KeyboardInterrupt:
