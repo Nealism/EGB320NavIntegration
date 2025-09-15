@@ -14,8 +14,8 @@ from DFRobot_RaspberryPi_DC_Motor import THIS_BOARD_TYPE, DFRobot_DC_Motor_IIC a
 '''
 subsystem integration modules
 '''
-from openCV.processing_module import process_frame, Obstacle
-from openCV.camera_module import Camera
+from cameraModules.processing_module import process_frame, Obstacle
+from cameraModules.camera_module import Camera
 import cv2
 
 if THIS_BOARD_TYPE:
@@ -103,7 +103,7 @@ def turnAngle(angle_deg,
               timeout_s=6.0,
               eps_deg=2.0,
               rpm_alpha=0.4,
-              do_probe=True,          # <— key: normalise encoder delta sign
+              do_probe=True,          # <â€” key: normalise encoder delta sign
               debug=False):
 
     # --- geometry ---
@@ -211,7 +211,61 @@ def turnAngle(angle_deg,
     achieved_theta_rad = (revs_diff_norm * (2.0 * math.pi * Rw_mm)) / L_mm
     return math.degrees(achieved_theta_rad)
 
+def turnAngle_seconds(angle, duty=100):
+   # 3 seconds at duty cycle of 100 is approximately 250 degrees
+   # therefore 1.083 seconds at duty cycle 100 for 90 degrees
+   # 0.012 seconds per degree
 
+    tConst = 0.012
+
+    timeDelta = abs(angle) * tConst
+
+    if angle > 0:
+        direction = 'right'
+    else:
+       direction = 'left'
+
+    if direction == 'right':
+        board.motor_movement([board.M1], board.CW, duty)
+        board.motor_movement([board.M2], board.CW, duty)
+    elif direction == 'left':
+       board.motor_movement([board.M1], board.CCW, duty)
+       board.motor_movement([board.M2], board.CCW, duty)
+
+    sleep(timeDelta)
+
+    board.motor_stop(board.ALL)
+
+
+
+# shelf helpers
+def calcShelfMarkersRB(obstacles):
+    shelfMarkers = Obstacle.filter_by_station_id(obstacles,1)
+    shelfMarkerRB = {0: None, 1: None, 2: None}
+    if shelfMarkers:
+        for shelf in shelfMarkers:
+            if shelf.type_name != "Picking Station":
+                shelfMarkerRB[shelf.station_id] = (shelf.distance, shelf.bearing[0])
+    return shelfMarkerRB
+
+
+
+TARGET_SHELF_INDEX = 2
+if TARGET_SHELF_INDEX > -1 and TARGET_SHELF_INDEX < 2:
+   TARGET_ROW_INDEX = 0
+elif TARGET_SHELF_INDEX > 1 and TARGET_SHELF_INDEX < 4:
+   TARGET_ROW_INDEX = 1
+elif TARGET_SHELF_INDEX > 3 and TARGET_SHELF_INDEX < 6:
+   TARGET_ROW_INDEX = 2
+
+TARGET_BAY = 1
+BEARING_LIMIT = 0.1
+
+
+def calcBayDistance():
+   reverseBayID = abs(TARGET_BAY-4)
+   distance = (reverseBayID-1)*26 + 13
+   return distance/100
 
 
    
@@ -243,7 +297,7 @@ if __name__ == "__main__":
 
         #robotMode = RobotMode.SEARCH_MARKER
 
-        robotMode = RobotMode.DEBUG_TEST
+        robotMode = RobotMode.SEARCH_MARKER
 
 
 
@@ -251,27 +305,63 @@ if __name__ == "__main__":
             frame = camera.capture_frame()
             obstacles, trajectory = process_frame(frame)
 
+            shelfMarkersRB = calcShelfMarkersRB(obstacles)
+
+
             if robotMode == RobotMode.DEBUG_TEST:
-                testAngle = turnAngle(90, maxDuty=80, minDuty=40, kp=120, timeout_s=6)
-                print("Requested 90°, achieved ~{:.1f}°".format(testAngle))
+                # testAngle = turnAngle(90, max_duty=80, min_duty=40, kp=120, timeout_s=6)
+                # print("Requested 90Â°, achieved ~{:.1f}Â°".format(testAngle))
+                # right is positive, left is negative
+                turnAngle_seconds(-90)
                 robotMode = RobotMode.DEBUG_STOP
 
             if robotMode == RobotMode.DEBUG_STOP:
-                board.motor_movement([board.M1], board.CW, 0)  
-                board.motor_movement([board.M2], board.CCW, 0)
+                board.motor_stop(board.ALL)
+            
+            if robotMode == RobotMode.SEARCH_MARKER:
+               if shelfMarkersRB[TARGET_ROW_INDEX]:
+                  rowmB = shelfMarkersRB[TARGET_ROW_INDEX][1]
+                  rowmD = shelfMarkersRB[TARGET_ROW_INDEX][0]
+                  if rowmB > 0:
+                     direction = 'right'
+                  else:
+                     direction = 'left'
+                  if rowmB > abs(BEARING_LIMIT):
+                    if direction == 'right':
+                       board.motor_movement([board.M1], board.CW, 50)
+                       board.motor_movement([board.M2], board.CW, 50)
+                    elif direction == 'left':
+                       board.motor_movement([board.M1], board.CCW, 50)
+                       board.motor_movement([board.M2], board.CCW, 50)
+                  else:
+                     board.motor_stop(board.ALL)
+                     robotMode = RobotMode.DRIVE_TO_BAY
+               else:
+                  board.motor_movement([board.M1], board.CW, 50)
+                  board.motor_movement([board.M2], board.CW, 50)
+
+            if robotMode == RobotMode.DRIVE_TO_BAY:
+               if shelfMarkersRB[TARGET_ROW_INDEX]:
+                  rowmB = shelfMarkersRB[TARGET_ROW_INDEX][1]
+                  rowmD = shelfMarkersRB[TARGET_ROW_INDEX][0]
+                  if rowmD > calcBayDistance():
+                     board.motor_movement([board.M1], board.CCW, 50)
+                     board.motor_movement([board.M2], board.CW, 50)
+                  else:
+                     board.motor_stop(board.ALL)
+                     robotMode = RobotMode.DEBUG_STOP
+                  
+
     except KeyboardInterrupt:
         print("\nShutting down...")
-        board.motor_movement([board.M1], board.CW, 0)  
-        board.motor_movement([board.M2], board.CCW, 0)
+        board.motor_stop(board.ALL)
     except Exception as e:
-       board.motor_movement([board.M1], board.CW, 0)  
-       board.motor_movement([board.M2], board.CCW, 0)
+       board.motor_stop(board.ALL)
        print(f"\nAn error occurred: {e}")
        traceback.print_exc()
     finally:
         camera.close()
         cv2.destroyAllWindows()
-
 
 
 
