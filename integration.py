@@ -3,11 +3,12 @@ import sys
 import os
 sys.path.append("../")
 
-from time import sleep, monotonic
+from time import sleep, monotonic, time
 import types
 import traceback
 from enum import IntEnum
 import math
+import numpy as np
 
 from DFRobot_RaspberryPi_DC_Motor import THIS_BOARD_TYPE, DFRobot_DC_Motor_IIC as Board
 
@@ -59,157 +60,80 @@ RIGHT_MOTOR_ID = board.M2
 LEFT_FORWARD_ORIENT = board.CW
 RIGHT_FORWARD_ORIENT = board.CCW
 
-def opposite(orient):
-    return board.CCW if orient == board.CW else board.CW
+def drive_distance(board, distance_m, speed_pct, wheel_diameter_m=WHEEL_DIAMETER_MM, gear_ratio=50,
+                   slow_down_window_m=0.10, min_speed_pct=15.0, poll_dt=0.01,
+                   watchdog_s=1.5):
+    """
+    Drive straight for distance_m (meters) at speed_pct (%) and stop.
+    Positive distance_m => CW, negative => CCW.
+    Uses get_encoder_speed() [RPM] and integrates to distance.
+    wheel_diameter_m: physical wheel diameter in meters.
+    gear_ratio: set to your gearbox ratio so the HAT reports *wheel* RPM (e.g., 50).
 
-def set_wheel(motor_id, duty_signed, forward_orient):
-    duty = abs(int(duty_signed))
-    if duty == 0:
-        board.motor_stop([motor_id])
-        return
-    orient = forward_orient if duty_signed >= 0 else opposite(forward_orient)
-    board.motor_movement([motor_id], orient, duty)
+    Returns the measured distance traveled (meters).
+    """
 
+    board.set_encoder_enable([board.M1, board.M2])
+    board.set_encoder_reduction_ratio([board.M1, board.M2], int(gear_ratio))
 
-def read_rpm(left_id=LEFT_MOTOR_ID, right_id=RIGHT_MOTOR_ID):
-    rpms = board.get_encoder_speed([left_id, right_id])
-    return float(rpms[0]), float(rpms[1])
+    target = abs(float(distance_m/2))
+    speed_pct = float(speed_pct)
+    circ = math.pi * float(wheel_diameter_m/1000)  # wheel circumference
 
+    # Safety clamps
+    speed_pct = max(0.0, min(100.0, speed_pct))
+    min_speed_pct = max(0.0, min(min_speed_pct, speed_pct))
 
-def calibrate_forward_orientations(test_duty=40, sample_s=0.25):
-    global LEFT_FORWARD_ORIENT, RIGHT_FORWARD_ORIENT
-    # Left
-    board.motor_movement([LEFT_MOTOR_ID], board.CW, test_duty)
-    board.motor_stop([RIGHT_MOTOR_ID])
-    sleep(sample_s)
-    l_rpm, _ = read_rpm()
-    LEFT_FORWARD_ORIENT = board.CW if l_rpm > 0 else board.CCW
-    board.motor_stop([LEFT_MOTOR_ID])
+    board.motor_movement([board.M1], board.CCW, speed_pct)
+    board.motor_movement([board.M2], board.CW, speed_pct)
 
-    # Right
-    board.motor_movement([RIGHT_MOTOR_ID], board.CW, test_duty)
-    board.motor_stop([LEFT_MOTOR_ID])
-    sleep(sample_s)
-    _, r_rpm = read_rpm()
-    RIGHT_FORWARD_ORIENT = board.CW if r_rpm > 0 else board.CCW
-    board.motor_stop([RIGHT_MOTOR_ID])
+    sL = sR = 0.0
+    s_last_change_t = monotonic()
+    t_prev = s_last_change_t
 
-    # small pause
-    sleep(0.2)
+    try:
+        while True:
+            sleep(poll_dt)
+            t_now = monotonic()
+            dt = t_now - t_prev
+            t_prev = t_now
 
-def turnAngle(angle_deg,
-              max_duty=65, min_duty=35,
-              kp=110.0,
-              timeout_s=6.0,
-              eps_deg=2.0,
-              rpm_alpha=0.4,
-              do_probe=True,          # <â€” key: normalise encoder delta sign
-              debug=False):
+            rpmL, rpmR = board.get_encoder_speed([board.M1, board.M2])
 
-    # --- geometry ---
-    Rw_mm = WHEEL_DIAMETER_MM / 2.0
-    L_mm  = TRACK_WIDTH_MM
-    theta_rad = math.radians(angle_deg)
-    target_revs_diff = (theta_rad * L_mm) / (2.0 * math.pi * Rw_mm)
-    eps_revs_diff    = (math.radians(eps_deg) * L_mm) / (2.0 * math.pi * Rw_mm)
+            # Convert RPM -> revolutions advanced over dt.
+            # Use absolute in case encoder sign differs from motor orientation wiring.
+            revL = abs(rpmL) * dt / 60.0
+            revR = abs(rpmR) * dt / 60.0
 
-    # Nominal spin directions (keep "one fwd / one back" ALL the time)
-    # +angle (left/CCW): RIGHT forward, LEFT backward
-    # -angle (right/CW): LEFT forward, RIGHT backward
-    left_nominal_sign, right_nominal_sign = ( -1, +1 ) if angle_deg >= 0 else ( +1, -1 )
+            # Distance per wheel
+            sL += revL * circ
+            sR += revR * circ
 
-    # Always start from rest
-    board.motor_stop(board.ALL)
-    sleep(0.05)
+            # Chassis distance = average of wheel distances
+            s = 0.5 * (sL + sR)
 
-    # ---- PROBE: figure out the sign of (rpmR - rpmL) for THIS pattern ----
-    # dir_gain makes "progress" positive when turning the requested way
-    dir_gain = 1.0
-    if do_probe:
-        probe_duty = max(min_duty + 5, 30)
-        set_wheel(LEFT_MOTOR_ID,  left_nominal_sign  * probe_duty, LEFT_FORWARD_ORIENT)
-        set_wheel(RIGHT_MOTOR_ID, right_nominal_sign * probe_duty, RIGHT_FORWARD_ORIENT)
-        sleep(0.20)
-        rpm_L0, rpm_R0 = read_rpm()
-        board.motor_stop(board.ALL)
-        sleep(0.05)
-        delta0 = (rpm_R0 - rpm_L0)
-        # If delta is <= 0, measured progress has opposite sign; flip the measurement sign
-        dir_gain = 1.0 if delta0 > 0 else -1.0
-        if debug:
-            print(f"[probe] rpm_L={rpm_L0:.1f}, rpm_R={rpm_R0:.1f}, delta={delta0:.1f}, dir_gain={dir_gain}")
+            # Watchdog: detect if weâ€™ve effectively stopped moving
+            if (revL + revR) > 0:
+                s_last_change_t = t_now
+            elif (t_now - s_last_change_t) > watchdog_s:
+                # Not moving for too long -> break to avoid hanging
+                break
 
-    # Optional "kick" to unstick
-    kick_duty = max(min_duty, int(0.6 * max_duty))
-    set_wheel(LEFT_MOTOR_ID,  left_nominal_sign  * kick_duty, LEFT_FORWARD_ORIENT)
-    set_wheel(RIGHT_MOTOR_ID, right_nominal_sign * kick_duty, RIGHT_FORWARD_ORIENT)
-    sleep(0.15)
+            remaining = target - s
+            if remaining <= 0:
+                break
 
-    # --- integrators / filters ---
-    revs_diff_norm = 0.0   # normalised "progress" (always increases for requested direction)
-    t_prev = monotonic()
-    t_start = t_prev
-    rpmL_f = None
-    rpmR_f = None
+            # 4) Simple taper near the goal to reduce overshoot
+            if remaining < slow_down_window_m:
+                scaled = speed_pct * (remaining / slow_down_window_m)
+                cmd_speed = max(min_speed_pct, scaled)
+                board.motor_movement([board.M1], board.CCW, speed_pct)
+                board.motor_movement([board.M2], board.CW, speed_pct)
 
-    # Control loop
-    while True:
-        t_now = monotonic()
-        dt = t_now - t_prev
-        t_prev = t_now
-        if dt <= 0:
-            dt = 1e-3
-
-        rpm_L, rpm_R = read_rpm()
-        if rpmL_f is None:
-            rpmL_f, rpmR_f = rpm_L, rpm_R
-        else:
-            rpmL_f = (1 - rpm_alpha) * rpmL_f + rpm_alpha * rpm_L
-            rpmR_f = (1 - rpm_alpha) * rpmR_f + rpm_alpha * rpm_R
-
-        # Normalised progress (flip sign if probe said it's inverted)
-        revs_diff_norm += (dir_gain * (rpmR_f - rpmL_f) / 60.0) * dt
-
-        err = target_revs_diff - revs_diff_norm
-
-        # stop conditions
-        if abs(err) <= max(eps_revs_diff, 1e-4):
-            break
-        if (t_now - t_start) > timeout_s:
-            if debug:
-                print("[turnAngle] timeout")
-            break
-
-        # P-control for duty magnitude
-        raw = kp * err
-        mag = max(min(abs(raw), max_duty), min_duty)
-
-        # Preserve in-place pattern at all times.
-        # If we overshoot (err < 0), both commands flip sign together,
-        # still keeping one fwd, one back.
-        s = 1.0 if raw >= 0 else -1.0
-        left_cmd  = left_nominal_sign  * s * mag
-        right_cmd = right_nominal_sign * s * mag
-
-        set_wheel(LEFT_MOTOR_ID,  left_cmd,  LEFT_FORWARD_ORIENT)
-        set_wheel(RIGHT_MOTOR_ID, right_cmd, RIGHT_FORWARD_ORIENT)
-
-        sleep(0.05)
-
-    # Stop + short brake to kill inertia
-    board.motor_stop(board.ALL)
-    sleep(0.03)
-    # Small opposite pulse (brake)
-    brake = max(0, min(min_duty, 30))
-    if brake > 0:
-        set_wheel(LEFT_MOTOR_ID,  -left_nominal_sign  * brake, LEFT_FORWARD_ORIENT)
-        set_wheel(RIGHT_MOTOR_ID, -right_nominal_sign * brake, RIGHT_FORWARD_ORIENT)
-        sleep(0.05)
+    finally:
         board.motor_stop(board.ALL)
 
-    # Report achieved angle using the normalised progress
-    achieved_theta_rad = (revs_diff_norm * (2.0 * math.pi * Rw_mm)) / L_mm
-    return math.degrees(achieved_theta_rad)
+    return 0.5 * (sL + sR)
 
 def turnAngle_seconds(angle, duty=100):
    # 3 seconds at duty cycle of 100 is approximately 250 degrees
@@ -237,6 +161,78 @@ def turnAngle_seconds(angle, duty=100):
     board.motor_stop(board.ALL)
 
 
+def turnAngle_encoder(board, angle, wheel_diameter_m=WHEEL_DIAMETER_MM, gear_ratio=50,
+               slow_down_window_m=0.10, min_speed_pct=15.0, poll_dt=0.01,
+               watchdog_s=1.5):
+    
+    board.set_encoder_enable([board.M1, board.M2])
+    board.set_encoder_reduction_ratio([board.M1, board.M2], int(gear_ratio))
+
+    mmPd = 1.48 # mm turn per degree
+
+    target = abs(float(angle*mmPd/1000))
+    if angle > 0:
+        direction = 'right'
+    else:
+        direction = 'left'
+
+    speed_pct = float(speed_pct)
+    circ = math.pi * float(wheel_diameter_m/1000)
+
+    speed_pct = max(0.0, min(100.0, speed_pct))
+    min_speed_pct = max(0.0, min(min_speed_pct, speed_pct))
+
+    if direction == 'right':
+        board.motor_movement([board.M1], board.CW, speed_pct)
+        board.motor_movement([board.M2], board.CW, speed_pct)
+    elif direction == 'left':
+        board.motor_movement([board.M1, board.CCW, speed_pct])
+        board.motor_movement([board.M2, board.CCW, speed_pct])
+
+    sL = sR = 0.0
+    s_last_change_t = monotonic()
+    t_prev = s_last_change_t
+
+    try:
+        while True:
+            sleep(poll_dt)
+            t_now = monotonic()
+            dt = t_now - t_prev
+
+            rpmL, rpmR = board.get_encoder_speed([board.M1, board.M2])
+
+            revL = abs(rpmL) * dt / 60.0
+            revR = abs(rpmR) * dt / 60.0
+
+            sL += revL * circ
+            sR += revR * circ
+
+            s = 0.5 * (sL + sR)
+
+            if (revL + revR) > 0:
+                s_last_change_t = t_now
+            elif (t_now - s_last_change_t) > watchdog_s:
+                break
+
+            remaining = target - s
+            if remaining <= 0:
+                break
+
+            if remaining < slow_down_window_m:
+                scaled = speed_pct * (remaining / slow_down_window_m)
+                cmd_speed = max(min_speed_pct, scaled)
+                if direction == 'right':
+                    board.motor_movement([board.M1], board.CW, speed_pct)
+                    board.motor_movement([board.M2], board.CW, speed_pct)
+                elif direction == 'left':
+                    board.motor_movement([board.M1, board.CCW, speed_pct])
+                    board.motor_movement([board.M2, board.CCW, speed_pct])
+    finally:
+        board.motor_stop(board.ALL)
+
+    return 0.5 * (sL + sR)
+    
+
 
 # shelf helpers
 def calcShelfMarkersRB(obstacles):
@@ -258,14 +254,84 @@ elif TARGET_SHELF_INDEX > 1 and TARGET_SHELF_INDEX < 4:
 elif TARGET_SHELF_INDEX > 3 and TARGET_SHELF_INDEX < 6:
    TARGET_ROW_INDEX = 2
 
-TARGET_BAY = 1
-BEARING_LIMIT = 0.1
+TARGET_BAY = 2
+BEARING_LIMIT = 5
 
 
 def calcBayDistance():
    reverseBayID = abs(TARGET_BAY-4)
    distance = (reverseBayID-1)*26 + 13
    return distance/100
+
+
+'''
+CAMERA OVERLAY CHECKERS
+'''
+def draw_overlay(frame, obstacles, trajectory, plot_options):
+    """Draw detection overlays on the frame"""
+    if plot_options.get('plot_contours', False):
+        for obstacle in obstacles:
+            x, y = obstacle.centre[0], obstacle.centre[1]
+            
+            # Draw shape based on available information and settings
+            if plot_options.get('plot_exact_contours', True) and obstacle.contour is not None:
+                # Draw exact contour if available
+                cv2.drawContours(frame, [obstacle.contour], -1, obstacle.colour_bgr, 2)
+            elif plot_options.get('plot_approximated_shapes', False):
+                # Fall back to approximated shapes if exact contours not available or not wanted
+                if obstacle.shape == "circle":
+                    radius = int(np.sqrt(obstacle.area / np.pi))
+                    cv2.circle(frame, obstacle.centre, radius, obstacle.colour_bgr, 2)
+                else:
+                    aspect_ratio = 1.2
+                    height = int(np.sqrt(obstacle.area / aspect_ratio))
+                    width = int(height * aspect_ratio)
+                    x1 = x - width//2
+                    y1 = y - height//2
+                    cv2.rectangle(frame, (x1, y1), (x1 + width, y1 + height), obstacle.colour_bgr, 2)
+            
+            # Draw center point if enabled
+            if plot_options.get('plot_centers', True):
+                cv2.circle(frame, obstacle.centre, 3, obstacle.colour_bgr, -1)
+            
+            # Draw text labels if enabled
+            if plot_options.get('plot_labels', True):
+                # Draw object type and ID (if applicable)
+                label_parts = []
+                label_parts.append(obstacle.type_name)
+                if obstacle.station_id is not None:
+                    label_parts.append(f"({obstacle.station_id})")
+                if obstacle.distance is not None:
+                    label_parts.append(f"{obstacle.distance:.2f}m")
+                
+                # First line: Type, ID, and distance
+                main_label = " ".join(label_parts)
+                cv2.putText(frame, main_label,
+                          (x + 10, y),
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                          obstacle.colour_bgr, 2)
+            
+                        
+                if obstacle.bearing is not None:
+                    # Bearing on third line
+                    bear_text = f"Bearing: ({obstacle.bearing[0]:.1f}, {obstacle.bearing[1]:.1f})"
+                    cv2.putText(frame, bear_text,
+                        (x + 10, y + 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        obstacle.colour_bgr, 2)
+
+    if plot_options['plot_trajectory'] and trajectory:
+        # Draw trajectory points
+        for point in trajectory:
+            cv2.circle(frame, point, 2, (0, 255, 255), -1)
+
+    if plot_options['plot_centre_reference']:
+        height, width = frame.shape[:2]
+        centrex, centrey = width // 2, height // 2
+        cv2.line(frame, (centrex, 0), (centrex, height), (255, 255, 255), 1)
+        cv2.line(frame, (0, centrey), (width, centrey), (255, 255, 255), 1)
+
+    return frame
 
 
    
@@ -297,21 +363,45 @@ if __name__ == "__main__":
 
         #robotMode = RobotMode.SEARCH_MARKER
 
-        robotMode = RobotMode.SEARCH_MARKER
+        robotMode = RobotMode.DRIVE_TO_BAY
+
+        plot_options = {
+            'print_data': False,
+            'plot_contours': True,          # Master switch for all shape drawing
+            'plot_exact_contours': True,    # Draw exact contours when available
+            'plot_approximated_shapes': False,  # Fall back to approximated shapes
+            'plot_centers': True,           # Draw center points
+            'plot_labels': True,            # Draw text labels
+            'plot_trajectory': False,        # Draw trajectory
+            'plot_centre_reference': False   # Draw center reference lines
+        }
 
 
 
         while True:
+            loop_start = time()
             frame = camera.capture_frame()
             obstacles, trajectory = process_frame(frame)
 
+            frame_with_overlay = draw_overlay(frame.copy(), obstacles, trajectory, plot_options)            
+            
+            # Calculate and display FPS
+            current_fps = 1.0 / (time() - loop_start)
+            #fps_smooth = fps_smooth * (1 - fps_alpha) + current_fps * fps_alpha
+            cv2.putText(frame_with_overlay, f'FPS: {current_fps:.1f}', 
+                      (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+            # Display results
+            cv2.imshow('Vision System', frame_with_overlay)
+
             shelfMarkersRB = calcShelfMarkersRB(obstacles)
+
+            print("robot mode is ", robotMode)
+
+            #sleep(2)
 
 
             if robotMode == RobotMode.DEBUG_TEST:
-                # testAngle = turnAngle(90, max_duty=80, min_duty=40, kp=120, timeout_s=6)
-                # print("Requested 90Â°, achieved ~{:.1f}Â°".format(testAngle))
-                # right is positive, left is negative
                 turnAngle_seconds(-90)
                 robotMode = RobotMode.DEBUG_STOP
 
@@ -319,24 +409,28 @@ if __name__ == "__main__":
                 board.motor_stop(board.ALL)
             
             if robotMode == RobotMode.SEARCH_MARKER:
-               if shelfMarkersRB[TARGET_ROW_INDEX]:
-                  rowmB = shelfMarkersRB[TARGET_ROW_INDEX][1]
-                  rowmD = shelfMarkersRB[TARGET_ROW_INDEX][0]
-                  if rowmB > 0:
-                     direction = 'right'
-                  else:
-                     direction = 'left'
-                  if rowmB > abs(BEARING_LIMIT):
-                    if direction == 'right':
-                       board.motor_movement([board.M1], board.CW, 50)
-                       board.motor_movement([board.M2], board.CW, 50)
-                    elif direction == 'left':
-                       board.motor_movement([board.M1], board.CCW, 50)
-                       board.motor_movement([board.M2], board.CCW, 50)
-                  else:
+                if shelfMarkersRB[TARGET_ROW_INDEX]:
+                    rowmB = shelfMarkersRB[TARGET_ROW_INDEX][1]
+                    rowmD = shelfMarkersRB[TARGET_ROW_INDEX][0]
+                    if rowmB > 0:
+                        direction = 'right'
+                    else:
+                        direction = 'left'
+                    if rowmB > abs(BEARING_LIMIT):
+                        if direction == 'right':
+                            print("Turning Right")
+                            board.motor_movement([board.M1], board.CW, 50)
+                            board.motor_movement([board.M2], board.CW, 50)
+                        elif direction == 'left':
+                            print("Turning Left")
+                            board.motor_movement([board.M1], board.CCW, 50)
+                            board.motor_movement([board.M2], board.CCW, 50)
+                        print(rowmB)
+                    else:
                      board.motor_stop(board.ALL)
                      robotMode = RobotMode.DRIVE_TO_BAY
-               else:
+                else:
+                  print("Not Found")
                   board.motor_movement([board.M1], board.CW, 50)
                   board.motor_movement([board.M2], board.CW, 50)
 
@@ -345,9 +439,11 @@ if __name__ == "__main__":
                   rowmB = shelfMarkersRB[TARGET_ROW_INDEX][1]
                   rowmD = shelfMarkersRB[TARGET_ROW_INDEX][0]
                   if rowmD > calcBayDistance():
-                     board.motor_movement([board.M1], board.CCW, 50)
-                     board.motor_movement([board.M2], board.CW, 50)
+                     print("Driving to bay: "+str(rowmD))
+                     drive_distance(board, distance_m=(rowmD-calcBayDistance()), speed_pct=50)
+                     robotMode = RobotMode.DEBUG_STOP
                   else:
+                     print("Arrived at bay")
                      board.motor_stop(board.ALL)
                      robotMode = RobotMode.DEBUG_STOP
 
@@ -363,7 +459,27 @@ if __name__ == "__main__":
                elif direction == 'right':
                   turnAngle_seconds(90)
                   robotMode = RobotMode.DEBUG_STOP
-                  
+
+            # Handle key presses
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('d'):
+                plot_options['print_data'] = not plot_options['print_data']
+            elif key == ord('l'):
+                plot_options['plot_labels'] = not plot_options['plot_labels']
+            elif key == ord('t'):
+                plot_options['plot_trajectory'] = not plot_options['plot_trajectory']
+            elif key == ord('c'):
+                plot_options['plot_contours'] = not plot_options['plot_contours']
+            elif key == ord('x'):
+                plot_options['plot_exact_contours'] = not plot_options['plot_exact_contours']
+            elif key == ord('a'):
+                plot_options['plot_approximated_shapes'] = not plot_options['plot_approximated_shapes']
+            elif key == ord('n'):
+                plot_options['plot_centers'] = not plot_options['plot_centers']
+            elif key == ord('r'):
+                plot_options['plot_centre_reference'] = not plot_options['plot_centre_reference']
 
     except KeyboardInterrupt:
         print("\nShutting down...")
@@ -373,8 +489,8 @@ if __name__ == "__main__":
        print(f"\nAn error occurred: {e}")
        traceback.print_exc()
     finally:
+        board.motor_stop(board.ALL)
         camera.close()
         cv2.destroyAllWindows()
-
 
 
